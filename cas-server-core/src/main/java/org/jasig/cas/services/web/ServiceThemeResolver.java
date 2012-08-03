@@ -18,6 +18,14 @@
  */
 package org.jasig.cas.services.web;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
 import org.jasig.cas.authentication.principal.Service;
 import org.jasig.cas.services.RegisteredService;
 import org.jasig.cas.services.ServicesManager;
@@ -26,84 +34,147 @@ import org.jasig.cas.web.support.WebUtils;
 import org.springframework.util.StringUtils;
 import org.springframework.web.servlet.theme.AbstractThemeResolver;
 
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import java.util.*;
-import java.util.regex.Pattern;
-
 /**
- * ThemeResolver to determine the theme for CAS based on the service provided.
- * The theme resolver will extract the service parameter from the Request object
- * and attempt to match the URL provided to a Service Id. If the service is
- * found, the theme associated with it will be used. If not, these is associated
- * with the service or the service was not found, a default theme will be used.
+ * ThemeResolver to determine the theme for CAS based on the the host header or
+ * on the service specified.  Includes the mobile-browser-detector that is part
+ * of ServiceThemeResolver.
+ * 
+ * Themes are now resolved in the following way, with higher precedence first:
+ * 1) The "theme" attribute stored in the session, if it exists and is not blank.
+ * 2) The theme configured in the service registry, if the service is registered.
+ * 3) A theme mapped from the host header, if the host header is matched to
+ *    something configured in the hostHeaderThemes property.
+ * 
+ * The "isMobile" and "browserType" request attributes are still set by interrogating
+ * the "User-Agent" header and matching the "mobileUserAgentPatterns" configuration.
+ * 
+ * The "theme" request attribute is still set based on the stored theme.
+ * 
+ * The hostHeaderThemes property configuration looks like this:
+ * <property name="hostHeaderThemes">
+ *   <map>
+ *     <entry key="cas.domain1.com" value="domain1theme" />
+ *     <entry key="cas.domain2.org" value="domain2theme" />
+ *   </map>
+ * </property>
  * 
  * @author Scott Battaglia
+ * @author Nathan Kopp
  * @version $Revision$ $Date$
  * @since 3.0
  */
-public final class ServiceThemeResolver extends AbstractThemeResolver {
+public final class ServiceThemeResolver extends AbstractThemeResolver
+{
 
     /** The ServiceRegistry to look up the service. */
     private ServicesManager servicesManager;
 
     private List<ArgumentExtractor> argumentExtractors;
 
-    private Map<Pattern,String> overrides = new HashMap<Pattern,String>();
+    private Map<Pattern, String> mobileUserAgentPatterns = new HashMap<Pattern, String>();
+    private Map<String, String> hostHeaderThemes = new HashMap<String, String>();
 
-    public String resolveThemeName(final HttpServletRequest request) {
-        if (this.servicesManager == null) {
-            return getDefaultThemeName();
-        }
+    public String resolveThemeName(final HttpServletRequest request)
+    {
+        String theme = getDefaultThemeName();
 
-        final Service service = WebUtils.getService(this.argumentExtractors, request);
-
-        final RegisteredService rService = this.servicesManager.findServiceBy(service);
-
-        // retrieve the user agent string from the request
-        String userAgent = request.getHeader("User-Agent");
-
-        if (userAgent == null) {
-            return getDefaultThemeName();
-        }
-
-        for (final Map.Entry<Pattern,String> entry : this.overrides.entrySet()) {
-            if (entry.getKey().matcher(userAgent).matches()) {
-                request.setAttribute("isMobile","true");
-                request.setAttribute("browserType", entry.getValue());
-                break;
+        // override with host-header-based theme
+        String hostHeader = request.getHeader("Host");
+        if (hostHeader != null)
+        {
+            String hostHeaderTheme = hostHeaderThemes.get(hostHeader.toLowerCase());
+            if (hostHeaderTheme != null)
+            {
+                theme = hostHeaderTheme;
             }
         }
 
-        return service != null && rService != null && StringUtils.hasText(rService.getTheme()) ? rService.getTheme() : getDefaultThemeName();
+        // override with service-based theme
+        if (this.servicesManager != null)
+        {
+            final Service service = WebUtils.getService(this.argumentExtractors, request);
+            final RegisteredService rService = this.servicesManager.findServiceBy(service);
+
+            if (rService != null && StringUtils.hasText(rService.getTheme())) theme = rService.getTheme();
+        }
+
+        // override with session-based theme
+        String sessionTheme = (String)request.getSession(true).getAttribute("theme");
+        if (StringUtils.hasText(sessionTheme))
+        {
+            theme = sessionTheme;
+        }
+        
+        // detect mobile browser types using User-Agent header - store info as
+        // request attributes
+        String userAgent = request.getHeader("User-Agent");
+        if (userAgent != null)
+        {
+            for (final Map.Entry<Pattern, String> entry : this.mobileUserAgentPatterns.entrySet())
+            {
+                if (entry.getKey().matcher(userAgent).matches())
+                {
+                    request.setAttribute("isMobile", "true");
+                    request.setAttribute("browserType", entry.getValue());
+                    break;
+                }
+            }
+        }
+
+        // store the theme as a request attribute
+        request.setAttribute("theme", theme);
+        return theme;
     }
 
-    public void setThemeName(final HttpServletRequest request, final HttpServletResponse response, final String themeName) {
-        // nothing to do here
+    public void setThemeName(final HttpServletRequest request, final HttpServletResponse response,
+                             final String themeName)
+    {
+        if(themeName==null || "theme".equals(themeName))
+        {
+            if(request.getSession(false)!=null)request.getSession(false).removeAttribute("theme");
+        }
+        request.getSession(true).setAttribute("theme", themeName);
     }
 
-    public void setServicesManager(final ServicesManager servicesManager) {
+    public void setServicesManager(final ServicesManager servicesManager)
+    {
         this.servicesManager = servicesManager;
     }
 
-    public void setArgumentExtractors(final List<ArgumentExtractor> argumentExtractors) {
+    public void setArgumentExtractors(final List<ArgumentExtractor> argumentExtractors)
+    {
         this.argumentExtractors = argumentExtractors;
     }
 
     /**
-     * Sets the map of mobile browsers.  This sets a flag on the request called "isMobile" and also
-     * provides the custom flag called browserType which can be mapped into the theme.
+     * Sets the map of mobile browsers. This sets a flag on the request called
+     * "isMobile" and also provides the custom flag called browserType which can
+     * be mapped into the theme.
      * <p>
      * Themes that understand isMobile should provide an alternative stylesheet.
-     *
-     * @param mobileOverrides the list of mobile browsers.
+     * 
+     * @param mobileOverrides
+     *            the list of mobile browsers.
      */
-    public void setMobileBrowsers(final Map<String,String> mobileOverrides) {
+    public void setMobileBrowsers(final Map<String, String> mobileOverrides)
+    {
         // initialize the overrides variable to an empty map
-        this.overrides = new HashMap<Pattern,String>();
+        this.mobileUserAgentPatterns = new HashMap<Pattern, String>();
 
-        for (final Map.Entry<String,String> entry : mobileOverrides.entrySet()) {
-            this.overrides.put(Pattern.compile(entry.getKey()), entry.getValue());
+        for (final Map.Entry<String, String> entry : mobileOverrides.entrySet())
+        {
+            this.mobileUserAgentPatterns.put(Pattern.compile(entry.getKey()), entry.getValue());
+        }
+    }
+
+    public void setHostHeaderThemes(final Map<String, String> hostHeaderOverrides)
+    {
+        // initialize the overrides variable to an empty map
+        this.hostHeaderThemes = new HashMap<String, String>();
+
+        for (final Map.Entry<String, String> entry : hostHeaderOverrides.entrySet())
+        {
+            this.hostHeaderThemes.put(entry.getKey().toLowerCase(), entry.getValue());
         }
     }
 }
